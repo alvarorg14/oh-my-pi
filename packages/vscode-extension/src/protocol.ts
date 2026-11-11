@@ -244,6 +244,14 @@ export type AgentStatus =
 	| { phase: "stopped"; message: string };
 
 /** Host → chat webview. */
+export interface WorkspaceMention {
+	name: string;
+	path: string;
+	kind: "file" | "folder";
+	mention: string;
+	openPath?: string;
+}
+
 export type ChatUpdate =
 	| { type: "status"; status: AgentStatus }
 	/**
@@ -279,6 +287,7 @@ export type ChatUpdate =
 	| { type: "thinkingLevels"; levels: ThinkingLevel[] }
 	/** Slash commands for composer completion. */
 	| { type: "commands"; commands: AvailableSlashCommand[] }
+	| { type: "mentionResults"; requestId: number; entries: WorkspaceMention[]; limited: boolean; error?: string }
 	/** Text printed by a local slash command (no agent turn). */
 	| { type: "commandOutput"; text: string }
 	/** Transient banner (errors, info) shown above the composer. */
@@ -367,6 +376,7 @@ export type ChatRequest =
 	| { type: "markSessionUnread"; path: string }
 	/** Pick files with the open dialog and insert them as `@path` mentions. */
 	| { type: "attachFiles" }
+	| { type: "searchMentions"; requestId: number; query: string; fresh: boolean }
 	| { type: "setModel"; provider: string; modelId: string }
 	| { type: "setThinkingLevel"; level: ThinkingLevel }
 	/** Enter or leave omp's plan mode, then send `prompt` if given (`/plan <prompt>`); the host replies with a fresh `state`. */

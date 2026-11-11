@@ -4913,3 +4913,23 @@ body.vscode-high-contrast-light .picker-trigger .icon.picker-gateway {
 	color: var(--c-fg-3);
 	font-size: var(--fs-sm);
 }
+
+/* The mirror keeps the editable draft in the textarea while making selected paths clickable. */
+.mention-overlay {
+	position: absolute;
+	inset: 0 auto auto 0;
+	z-index: 2;
+	overflow: hidden;
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+	color: transparent;
+	pointer-events: none;
+}
+
+.draft-mention-link {
+	color: var(--vscode-textLink-foreground);
+	background: var(--vscode-input-background, var(--c-bg));
+	text-decoration: underline;
+	cursor: pointer;
+	pointer-events: auto;
+}

@@ -120,7 +120,22 @@ function bubble(text: string, images: ImageContent[], onEdit?: () => void, quote
 	if (quote !== undefined) {
 		body.append(h("div", { className: "bubble-quote", dataset: { tooltip: quote } }, quote));
 	}
-	if (text) body.append(h("div", { className: "bubble-text" }, text));
+	if (text) {
+		const content = h("div", { className: "bubble-text" });
+		let offset = 0;
+		for (const match of text.matchAll(/(^|[\s([{<"'`])@(?:"([^"]+)"|'([^']+)'|([^\s@]+))/g)) {
+			const path = match[2] ?? match[3] ?? match[4];
+			if (!path || (!path.includes("/") && !/\.[\w-]+$/.test(path))) continue;
+			const start = match.index + match[1]!.length;
+			content.append(
+				text.slice(offset, start),
+				fileLink(path, `@${path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? path}`),
+			);
+			offset = match.index + match[0].length;
+		}
+		content.append(text.slice(offset));
+		body.append(content);
+	}
 	if (images.length > 0) {
 		body.append(h("div", { className: "thumbs" }, ...images.map(image => thumbnail(image))));
 	}

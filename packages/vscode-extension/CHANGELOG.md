@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Open selected file mentions from the chat and see their filenames while their full paths are sent to the agent
+- Search and select workspace files and folders by typing `@` in the chat composer
+
+### Fixed
+
+- Keep the file picker visible while its results update as you type
+
 ## [0.36.0]
 
 ### Added

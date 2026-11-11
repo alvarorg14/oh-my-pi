@@ -8,6 +8,7 @@
 import type {
 	AsyncJob,
 	AvailableSlashCommand,
+	WorkspaceMention,
 	ChatRequest,
 	ChatUpdate,
 	ImageContent,
@@ -26,6 +27,8 @@ import { CleanupOffer } from "./cleanup-offer";
 import { ContextMeter } from "./context-meter";
 import { DictationControl, type DictationState } from "./dictation";
 import { GhostText } from "./ghost-text";
+import { type DraftMention, expandDraftMentions, updateDraftMentions } from "./draft-mentions";
+import { mentionToken, replaceMention } from "./mention-token";
 import { openLightbox } from "./lightbox";
 import { ModelPicker } from "./model-picker";
 import { PlanRunPanel } from "./plan-run-panel";
@@ -62,6 +65,7 @@ export interface ComposerOptions {
 export interface ComposerState {
 	draft: string;
 	quote?: string;
+	mentions?: DraftMention[];
 }
 
 const MAX_SUGGESTIONS = 50;
@@ -124,6 +128,16 @@ export class Composer {
 	#commands: AvailableSlashCommand[] = [];
 	#local = new Map<string, LocalCommand>();
 	#matches: AvailableSlashCommand[] = [];
+	#mentionMatches: WorkspaceMention[] = [];
+	#mentionActive = false;
+	#mentionPending = false;
+	#mentionFresh = false;
+	#workspaceEnabled = false;
+	#mentionRequest = 0;
+	#mentionTimer: number | undefined;
+	#draftMentions: DraftMention[] = [];
+	#previousDraft = "";
+	#mentionOverlay = h("div", { className: "mention-overlay" });
 	#selected = 0;
 	/** Draft text for which the user dismissed the popup with Escape. */
 	#dismissedFor: string | undefined;
@@ -187,6 +201,15 @@ export class Composer {
 		this.#renderDelegateToggle();
 		this.setCommands([]);
 		this.#input.value = initial.draft;
+		this.#previousDraft = initial.draft;
+		this.#draftMentions = (initial.mentions ?? []).filter(
+			entry => initial.draft.slice(entry.start, entry.end) === entry.label,
+		);
+		this.#ghost.element.append(this.#mentionOverlay);
+		new ResizeObserver(() => this.#renderDraftMentions()).observe(this.#input);
+		this.#input.addEventListener("scroll", () => {
+			this.#mentionOverlay.scrollTop = this.#input.scrollTop;
+		});
 		this.#quote = initial.quote;
 		this.#renderQuote();
 		// Typing ends browsing; programmatic changes fire no `input` event.
@@ -196,6 +219,11 @@ export class Composer {
 		});
 		this.#input.addEventListener("keydown", event => this.#onKeyDown(event));
 		this.#input.addEventListener("paste", event => this.#onPaste(event));
+		this.#input.addEventListener("click", () => this.#updatePopup());
+		this.#input.addEventListener("keyup", event => {
+			if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Home" || event.key === "End")
+				this.#updatePopup();
+		});
 		this.#input.addEventListener("blur", () => setTimeout(() => this.#closePopup(), 150));
 		this.#popup.addEventListener("mousedown", event => event.preventDefault());
 
@@ -240,6 +268,7 @@ export class Composer {
 			),
 		);
 		this.#refresh();
+		this.#renderDraftMentions();
 	}
 
 	setBusy(busy: boolean): void {
@@ -436,6 +465,12 @@ export class Composer {
 	/** The shown chat changed: ↑ starts again from its newest prompt. */
 	resetHistoryNavigation(): void {
 		this.#historyIndex = -1;
+		this.#closePopup();
+	}
+
+	setWorkspaceEnabled(enabled: boolean): void {
+		this.#workspaceEnabled = enabled;
+		if (!enabled) this.#closePopup();
 	}
 
 	focus(): void {
@@ -486,16 +521,65 @@ export class Composer {
 		if (state === "idle") this.focus();
 	}
 
+	#renderDraftMentions(): void {
+		const style = getComputedStyle(this.#input);
+		const overlay = this.#mentionOverlay;
+		for (const property of [
+			"fontFamily",
+			"fontSize",
+			"fontWeight",
+			"fontStyle",
+			"lineHeight",
+			"letterSpacing",
+			"wordSpacing",
+			"tabSize",
+			"textIndent",
+			"textTransform",
+			"paddingTop",
+			"paddingRight",
+			"paddingBottom",
+			"paddingLeft",
+		] as const) {
+			overlay.style[property] = style[property];
+		}
+		overlay.style.width = `${this.#input.clientWidth}px`;
+		overlay.style.height = `${this.#input.clientHeight}px`;
+		const nodes: (string | HTMLElement)[] = [];
+		let offset = 0;
+		for (const entry of [...this.#draftMentions].sort((a, b) => a.start - b.start)) {
+			nodes.push(this.#input.value.slice(offset, entry.start));
+			const link = h("a", { className: "draft-mention-link", title: entry.path, tabIndex: 0 }, entry.label);
+			link.addEventListener("click", event => {
+				event.preventDefault();
+				this.post({ type: "openFile", path: entry.path });
+			});
+			link.addEventListener("keydown", event => {
+				if (event.key === "Enter") {
+					event.preventDefault();
+					this.post({ type: "openFile", path: entry.path });
+				}
+			});
+			nodes.push(link);
+			offset = entry.end;
+		}
+		nodes.push(this.#input.value.slice(offset));
+		overlay.replaceChildren(...nodes);
+		overlay.scrollTop = this.#input.scrollTop;
+	}
+
 	#onInput(): void {
+		this.#draftMentions = updateDraftMentions(this.#previousDraft, this.#input.value, this.#draftMentions);
+		this.#previousDraft = this.#input.value;
 		this.#dismissedFor = undefined;
 		this.#save();
 		this.#refresh();
+		this.#renderDraftMentions();
 		this.#updatePopup();
 		this.#ghost.onInput();
 	}
 
 	#save(): void {
-		this.saveState({ draft: this.#input.value, quote: this.#quote });
+		this.saveState({ draft: this.#input.value, quote: this.#quote, mentions: this.#draftMentions });
 	}
 
 	#refresh(): void {
@@ -528,7 +612,7 @@ export class Composer {
 	}
 
 	#submit(): void {
-		const text = this.#input.value;
+		const text = expandDraftMentions(this.#input.value, this.#draftMentions);
 		if ((text.trim() === "" && this.#images.length === 0) || this.#input.disabled) return;
 		const command = /^\s*\/(\S+)\s*([\s\S]*)$/.exec(text);
 		const name = command?.[1];
@@ -649,7 +733,37 @@ export class Composer {
 	#onKeyDown(event: KeyboardEvent): void {
 		if (event.isComposing || event.keyCode === 229) return;
 		const popupOpen = !this.#popup.hidden;
-		if (popupOpen) {
+		if (popupOpen && this.#mentionActive) {
+			if (event.key === "Escape") {
+				event.preventDefault();
+				this.#dismissedFor = this.#input.value;
+				this.#closePopup();
+				return;
+			}
+			if (
+				this.#mentionPending &&
+				(event.key === "ArrowDown" ||
+					event.key === "ArrowUp" ||
+					event.key === "Tab" ||
+					(event.key === "Enter" && !event.shiftKey))
+			) {
+				event.preventDefault();
+				return;
+			}
+			if (this.#mentionMatches.length && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+				event.preventDefault();
+				const step = event.key === "ArrowDown" ? 1 : -1;
+				this.#selected = (this.#selected + step + this.#mentionMatches.length) % this.#mentionMatches.length;
+				this.#renderMentions();
+				return;
+			}
+			if (this.#mentionMatches.length && ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab")) {
+				event.preventDefault();
+				this.#completeMention(this.#mentionMatches[this.#selected]!);
+				return;
+			}
+		}
+		if (popupOpen && !this.#mentionActive) {
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				const step = event.key === "ArrowDown" ? 1 : -1;
@@ -750,7 +864,104 @@ export class Composer {
 		return { start, query: match[2]!, skillsOnly: start > 0 };
 	}
 
+	#mentionToken(): { start: number; query: string } | undefined {
+		if (
+			!this.#workspaceEnabled ||
+			this.#input.disabled ||
+			this.#dismissedFor === this.#input.value ||
+			this.#input.selectionStart !== this.#input.selectionEnd
+		)
+			return undefined;
+		return mentionToken(this.#input.value, this.#input.selectionStart);
+	}
+
+	mentionResults(update: Extract<ChatUpdate, { type: "mentionResults" }>): void {
+		if (!this.#mentionActive || update.requestId !== this.#mentionRequest || !this.#mentionToken()) return;
+		this.#mentionPending = false;
+		this.#popup.ariaBusy = "false";
+		this.#mentionMatches = update.entries;
+		this.#selected = 0;
+		this.#renderMentions(
+			update.error ??
+				(update.limited ? "More results available. Type a folder path to narrow the search." : undefined),
+		);
+	}
+
+	#renderMentions(message?: string): void {
+		this.#popup.replaceChildren(
+			...this.#mentionMatches.map((entry, index) => {
+				const item = h(
+					"div",
+					{ className: "slash-item", role: "option", ariaSelected: String(index === this.#selected) },
+					h("span", { className: "slash-name" }, entry.kind === "folder" ? "📁" : "📄"),
+					h("span", { className: "slash-name" }, entry.name),
+					h("span", { className: "slash-desc", dataset: { tooltip: entry.path } }, entry.path),
+				);
+				item.addEventListener("click", () => this.#completeMention(entry));
+				return item;
+			}),
+		);
+		if (message || this.#mentionMatches.length === 0)
+			this.#popup.append(
+				h("div", { className: "slash-item slash-desc" }, message ?? "No matching files or folders"),
+			);
+		this.#popup.children[this.#selected]?.scrollIntoView({ block: "nearest" });
+	}
+
+	#completeMention(entry: WorkspaceMention): void {
+		if (this.#mentionPending || !this.#mentionToken()) return;
+		const label = `@${entry.name}`;
+		const token = this.#mentionToken()!;
+		const result = replaceMention(this.#input.value, this.#input.selectionEnd, label);
+		if (!result) return;
+		this.#draftMentions = updateDraftMentions(this.#input.value, result.value, this.#draftMentions);
+		const rawPath = entry.mention.slice(1);
+		const path =
+			(rawPath.startsWith('"') && rawPath.endsWith('"')) || (rawPath.startsWith("'") && rawPath.endsWith("'"))
+				? rawPath.slice(1, -1)
+				: rawPath;
+		this.#draftMentions.push({
+			start: token.start,
+			end: token.start + label.length,
+			label,
+			mention: entry.mention,
+			path: entry.openPath ?? path,
+		});
+		this.#input.value = result.value;
+		this.#previousDraft = result.value;
+		this.#input.setSelectionRange(result.cursor, result.cursor);
+		this.#renderDraftMentions();
+		this.#closePopup();
+		this.#save();
+		this.#refresh();
+		this.focus();
+	}
+
 	#updatePopup(): void {
+		const mention = this.#mentionToken();
+		if (mention) {
+			if (!this.#mentionActive) {
+				this.#mentionFresh = true;
+				this.#mentionMatches = [];
+				this.#selected = 0;
+				this.#popup.replaceChildren(h("div", { className: "slash-item slash-desc" }, "Searching…"));
+			}
+			this.#mentionActive = true;
+			this.#mentionPending = true;
+			this.#popup.ariaBusy = "true";
+			this.#popup.hidden = false;
+			const requestId = ++this.#mentionRequest;
+			window.clearTimeout(this.#mentionTimer);
+			this.#mentionTimer = window.setTimeout(() => {
+				const fresh = this.#mentionFresh;
+				this.#mentionFresh = false;
+				this.post({ type: "searchMentions", requestId, query: mention.query, fresh });
+			}, 100);
+			return;
+		}
+		this.#mentionActive = false;
+		this.#mentionPending = false;
+		this.#popup.ariaBusy = "false";
 		const token = this.#slashToken();
 		if (token === undefined || this.#input.disabled) {
 			this.#closePopup();
@@ -816,6 +1027,11 @@ export class Composer {
 	}
 
 	#closePopup(): void {
+		window.clearTimeout(this.#mentionTimer);
+		this.#mentionRequest++;
+		this.#mentionActive = false;
+		this.#mentionPending = false;
+		this.#popup.ariaBusy = "false";
 		this.#popup.hidden = true;
 		this.#selected = 0;
 	}

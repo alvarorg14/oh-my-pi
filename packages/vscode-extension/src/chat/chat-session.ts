@@ -13,7 +13,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { SessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/wire/rpc-wire.generated";
 import { agentDir, readConfig, workspaceCwd } from "../config";
-import type { AgentStatus, ChatRequest, ChatUpdate, ModelChoice } from "../protocol";
+import type { AgentStatus, ChatRequest, ChatUpdate, ModelChoice, WorkspaceMention } from "../protocol";
 import { OmpCommandError, type OmpProcess } from "../rpc/omp-process";
 import { renameStoredSession } from "../sessions/rename";
 import { sessionSearch } from "../sessions/session-search";
@@ -33,6 +33,7 @@ import {
 import type { AgentPool } from "./agent-pool";
 import type { ExamplePromptStore } from "./example-prompt-store";
 import { mentionCandidates } from "./mentioned-file";
+import { formatWorkspaceMention, rankWorkspaceMentions } from "./workspace-mentions";
 
 export interface ChatSurface {
 	readonly webview: vscode.Webview;
@@ -460,8 +461,90 @@ export class ChatSession implements vscode.Disposable, HostView {
 		});
 	}
 
+	#mentionIndex: Promise<{ entries: WorkspaceMention[]; limited: boolean }> | undefined;
+
+	async #searchMentions(query: string, fresh: boolean): Promise<{ entries: WorkspaceMention[]; limited: boolean }> {
+		if (this.#host?.noWorkspace) return { entries: [], limited: false };
+		if (fresh || !this.#mentionIndex) this.#mentionIndex = this.#buildMentionIndex();
+		const index = await this.#mentionIndex;
+		const slash = query.lastIndexOf("/");
+		let entries = index.entries;
+		if (slash >= 0) {
+			const scope = query.slice(0, slash);
+			const extra = await this.#buildMentionIndex(scope);
+			entries = [...entries, ...extra.entries];
+		}
+		return { entries: rankWorkspaceMentions(entries, query), limited: index.limited };
+	}
+
+	async #buildMentionIndex(scope = ""): Promise<{ entries: WorkspaceMention[]; limited: boolean }> {
+		const roots = vscode.workspace.workspaceFolders ?? [];
+		const entries = new Map<string, WorkspaceMention>();
+		const excluded = /(?:^|\/)(?:node_modules|\.git|\.venv|venv|dist|build|out|target)(?:\/|$)/;
+		let limited = false;
+		for (const root of roots) {
+			const cleanScope = scope.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+			if (cleanScope.split("/").includes("..") || excluded.test(cleanScope)) continue;
+			const base = vscode.Uri.joinPath(root.uri, cleanScope);
+			const add = (uri: vscode.Uri, kind: "file" | "folder") => {
+				const relative = path.relative(root.uri.fsPath, uri.fsPath).replace(/\\/g, "/");
+				if (!relative || excluded.test(relative)) return;
+				const workingDirectory = this.#host?.process?.command.cwd ?? workspaceCwd();
+				const mentionPath = path.relative(workingDirectory, uri.fsPath).replace(/\\/g, "/");
+				const mention = formatWorkspaceMention(mentionPath);
+				if (!mention) return;
+				entries.set(uri.toString(), {
+					name: path.basename(uri.fsPath),
+					path: roots.length > 1 ? `${root.name}/${relative}` : relative,
+					kind,
+					mention,
+					openPath: uri.fsPath,
+				});
+			};
+			const files = await vscode.workspace.findFiles(
+				new vscode.RelativePattern(base, "**/*"),
+				SEARCH_EXCLUDE,
+				20001,
+			);
+			if (files.length > 20000) limited = true;
+			for (const file of files.slice(0, 20000)) {
+				add(file, "file");
+				let parent = path.dirname(file.fsPath);
+				while (parent !== root.uri.fsPath && parent.startsWith(root.uri.fsPath + path.sep)) {
+					add(vscode.Uri.file(parent), "folder");
+					parent = path.dirname(parent);
+				}
+			}
+			try {
+				for (const [name, kind] of await vscode.workspace.fs.readDirectory(base)) {
+					if (kind & vscode.FileType.Directory) add(vscode.Uri.joinPath(base, name), "folder");
+				}
+			} catch {
+				// A typed scope may not exist in every workspace root.
+			}
+		}
+		return { entries: [...entries.values()], limited };
+	}
+
 	async #handle(request: ChatRequest): Promise<void> {
 		switch (request.type) {
+			case "searchMentions": {
+				const host = this.#host;
+				try {
+					const result = await this.#searchMentions(request.query, request.fresh);
+					if (this.#host === host) this.post({ type: "mentionResults", requestId: request.requestId, ...result });
+				} catch {
+					if (this.#host === host)
+						this.post({
+							type: "mentionResults",
+							requestId: request.requestId,
+							entries: [],
+							limited: false,
+							error: "Could not search the workspace.",
+						});
+				}
+				return;
+			}
 			case "focusChanged":
 				this.#onDidChangeFocus.fire(request.focused);
 				return;
